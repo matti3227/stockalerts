@@ -423,7 +423,12 @@ def _run_reddit():
 
 
 def _run_stocktwits():
-    StockTwitsScraper().scrape()
+    logger.info("Starting StockTwits scraper")
+    try:
+        count = StockTwitsScraper().scrape()
+        logger.info("Scraper completed: %d posts saved", count)
+    except Exception:
+        logger.exception("StockTwits scraper raised an unhandled exception")
 
 
 @app.post("/api/scrape/reddit", response_model=ScrapeResult)
