@@ -1,9 +1,11 @@
 import logging
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
+import pandas as pd
 import yfinance as yf
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,27 +27,79 @@ logger = logging.getLogger(__name__)
 # Price cache  (ticker -> (price, pct_change, fetched_at))
 # ---------------------------------------------------------------------------
 
-_price_cache: dict[str, tuple[float, float, datetime]] = {}
+_price_cache: dict[str, tuple[Optional[float], Optional[float], datetime]] = {}
 _PRICE_TTL = timedelta(minutes=5)
 
 
-def _get_price(ticker: str) -> tuple[Optional[float], Optional[float]]:
-    """Return (price, pct_change) for *ticker*, using a 5-minute in-memory cache."""
+def _clean(val) -> Optional[float]:
+    """Convert a yfinance value to float, returning None for NaN/None."""
+    try:
+        f = float(val)
+        return None if math.isnan(f) else f
+    except Exception:
+        return None
+
+
+def _batch_fetch_prices(
+    tickers: list[str],
+) -> dict[str, tuple[Optional[float], Optional[float]]]:
+    """Fetch price + daily % change for all tickers in one yfinance call."""
     now = datetime.utcnow()
-    cached = _price_cache.get(ticker)
-    if cached and (now - cached[2]) < _PRICE_TTL:
-        return cached[0], cached[1]
+    result: dict[str, tuple[Optional[float], Optional[float]]] = {}
+    to_fetch: list[str] = []
+
+    for t in tickers:
+        cached = _price_cache.get(t)
+        if cached and (now - cached[2]) < _PRICE_TTL:
+            result[t] = (cached[0], cached[1])
+        else:
+            to_fetch.append(t)
+
+    if not to_fetch:
+        return result
 
     try:
-        info = yf.Ticker(ticker).fast_info
-        price = float(info.last_price) if info.last_price else None
-        prev_close = float(info.previous_close) if info.previous_close else None
-        pct = round((price - prev_close) / prev_close * 100, 2) if price and prev_close else None
-        _price_cache[ticker] = (price, pct, now)
-        return price, pct
+        logger.info("Fetching prices for: %s", to_fetch)
+        data = yf.download(
+            tickers=to_fetch,
+            period="2d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        # Multi-ticker download returns a MultiIndex DataFrame; single-ticker is flat.
+        if isinstance(data.columns, pd.MultiIndex):
+            close = data["Close"]
+        else:
+            close = data[["Close"]].rename(columns={"Close": to_fetch[0]})
+
+        for ticker in to_fetch:
+            try:
+                series = close[ticker].dropna() if ticker in close.columns else pd.Series([], dtype=float)
+                if len(series) >= 2:
+                    price = _clean(series.iloc[-1])
+                    prev  = _clean(series.iloc[-2])
+                    pct   = round((price - prev) / prev * 100, 2) if price and prev else None
+                elif len(series) == 1:
+                    price = _clean(series.iloc[-1])
+                    pct   = None
+                else:
+                    price, pct = None, None
+            except Exception:
+                logger.exception("Error extracting price for %s", ticker)
+                price, pct = None, None
+
+            logger.info("Price %s: price=%s pct=%s", ticker, price, pct)
+            _price_cache[ticker] = (price, pct, now)
+            result[ticker] = (price, pct)
+
     except Exception:
-        logger.warning("Could not fetch price for %s", ticker)
-        return None, None
+        logger.exception("yfinance batch download failed for %s", to_fetch)
+        for t in to_fetch:
+            result[t] = (None, None)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -210,18 +264,20 @@ def get_trending(
     )
     rows = result.all()
 
-    items = []
-    for row in rows:
-        price, pct = _get_price(row.ticker)
-        items.append(TrendingItem(
+    tickers = [row.ticker for row in rows]
+    prices = _batch_fetch_prices(tickers)
+
+    return [
+        TrendingItem(
             ticker=row.ticker,
             mention_count=row.mention_count,
             avg_sentiment=round(row.avg_sentiment or 0.0, 4),
             sentiment_label=_sentiment_label(row.avg_sentiment or 0.0),
-            price=price,
-            percent_change=pct,
-        ))
-    return items
+            price=prices.get(row.ticker, (None, None))[0],
+            percent_change=prices.get(row.ticker, (None, None))[1],
+        )
+        for row in rows
+    ]
 
 
 @app.get("/api/ticker/{symbol}", response_model=TickerDetail)
