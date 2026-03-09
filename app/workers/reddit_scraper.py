@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import re
 from datetime import datetime
@@ -8,7 +7,7 @@ from sqlalchemy import select
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from app.config import settings
-from app.database import AsyncSessionLocal
+from app.database import SessionLocal
 from app.models.schemas import Mention, Post
 
 logger = logging.getLogger(__name__)
@@ -79,7 +78,6 @@ class RedditScraper:
             user_agent=settings.reddit_user_agent,
         )
 
-    # PRAW is synchronous — run it in a thread-pool executor
     def _fetch_subreddit(self, subreddit_name: str, limit: int = 100) -> list[dict]:
         results = []
         subreddit = self._reddit.subreddit(subreddit_name)
@@ -105,23 +103,20 @@ class RedditScraper:
             )
         return results
 
-    async def scrape(self) -> int:
+    def scrape(self) -> int:
         """Scrape all configured subreddits and persist new posts. Returns count saved."""
         total = 0
-        loop = asyncio.get_event_loop()
 
         for subreddit_name in SUBREDDITS:
             try:
                 logger.info("Scraping r/%s", subreddit_name)
-                posts_data = await loop.run_in_executor(
-                    None, self._fetch_subreddit, subreddit_name
-                )
+                posts_data = self._fetch_subreddit(subreddit_name)
 
-                async with AsyncSessionLocal() as db:
+                with SessionLocal() as db:
                     for data in posts_data:
                         tickers = data.pop("_tickers")
 
-                        result = await db.execute(
+                        result = db.execute(
                             select(Post).where(Post.external_id == data["external_id"])
                         )
                         if result.scalar_one_or_none():
@@ -129,7 +124,7 @@ class RedditScraper:
 
                         post = Post(**data)
                         db.add(post)
-                        await db.flush()  # get post.id
+                        db.flush()  # get post.id
 
                         for ticker in tickers:
                             db.add(
@@ -141,7 +136,7 @@ class RedditScraper:
                             )
                         total += 1
 
-                    await db.commit()
+                    db.commit()
 
             except Exception:
                 logger.exception("Failed to scrape r/%s", subreddit_name)

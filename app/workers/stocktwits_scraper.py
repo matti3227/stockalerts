@@ -7,7 +7,7 @@ from sqlalchemy import select
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from app.config import settings
-from app.database import AsyncSessionLocal
+from app.database import SessionLocal
 from app.models.schemas import Mention, Post
 
 logger = logging.getLogger(__name__)
@@ -51,9 +51,9 @@ class StockTwitsScraper:
         if settings.stocktwits_access_token:
             self._headers["Authorization"] = f"OAuth {settings.stocktwits_access_token}"
 
-    async def _get_trending_tickers(self, client: httpx.AsyncClient) -> list[str]:
+    def _get_trending_tickers(self, client: httpx.Client) -> list[str]:
         try:
-            resp = await client.get(
+            resp = client.get(
                 f"{STOCKTWITS_BASE}/trending/symbols.json",
                 headers=self._headers,
                 timeout=10.0,
@@ -65,11 +65,9 @@ class StockTwitsScraper:
             logger.warning("Could not fetch trending symbols, using defaults")
             return DEFAULT_TICKERS
 
-    async def _get_symbol_stream(
-        self, client: httpx.AsyncClient, ticker: str
-    ) -> list[dict]:
+    def _get_symbol_stream(self, client: httpx.Client, ticker: str) -> list[dict]:
         try:
-            resp = await client.get(
+            resp = client.get(
                 f"{STOCKTWITS_BASE}/streams/symbol/{ticker}.json",
                 params={"limit": 30},
                 headers=self._headers,
@@ -84,24 +82,24 @@ class StockTwitsScraper:
             logger.exception("Error fetching StockTwits stream for %s", ticker)
             return []
 
-    async def scrape(self) -> int:
+    def scrape(self) -> int:
         """Fetch trending tickers and their message streams. Returns count saved."""
         total = 0
 
-        async with httpx.AsyncClient() as client:
-            tickers = await self._get_trending_tickers(client)
+        with httpx.Client() as client:
+            tickers = self._get_trending_tickers(client)
 
             for ticker in tickers:
-                messages = await self._get_symbol_stream(client, ticker)
+                messages = self._get_symbol_stream(client, ticker)
                 if not messages:
                     continue
 
                 try:
-                    async with AsyncSessionLocal() as db:
+                    with SessionLocal() as db:
                         for msg in messages:
                             external_id = f"stocktwits_{msg['id']}"
 
-                            result = await db.execute(
+                            result = db.execute(
                                 select(Post).where(Post.external_id == external_id)
                             )
                             if result.scalar_one_or_none():
@@ -134,7 +132,7 @@ class StockTwitsScraper:
                                 created_at=created_at,
                             )
                             db.add(post)
-                            await db.flush()
+                            db.flush()
 
                             db.add(
                                 Mention(
@@ -145,7 +143,7 @@ class StockTwitsScraper:
                             )
                             total += 1
 
-                        await db.commit()
+                        db.commit()
 
                 except Exception:
                     logger.exception("Failed to persist StockTwits data for %s", ticker)

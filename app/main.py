@@ -8,7 +8,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.database import get_db, init_db
 from app.models.schemas import Alert, Mention, Post, TickerMetric
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    init_db()
     logger.info("Database tables ready")
     yield
 
@@ -127,10 +127,10 @@ def _sentiment_label(score: float) -> str:
     return "neutral"
 
 
-async def _trigger_webhook(url: str, payload: dict) -> None:
+def _trigger_webhook(url: str, payload: dict) -> None:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(url, json=payload)
+        with httpx.Client(timeout=10.0) as client:
+            client.post(url, json=payload)
     except Exception:
         logger.exception("Webhook delivery failed: %s", url)
 
@@ -140,20 +140,20 @@ async def _trigger_webhook(url: str, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health():
+def health():
     return {"status": "ok", "timestamp": datetime.utcnow()}
 
 
 @app.get("/api/trending", response_model=list[TrendingItem])
-async def get_trending(
+def get_trending(
     limit: int = 10,
     hours: int = 24,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ):
     """Top tickers by mention count over the last *hours* hours."""
     since = datetime.utcnow() - timedelta(hours=hours)
 
-    result = await db.execute(
+    result = db.execute(
         select(
             Mention.ticker,
             func.count(Mention.id).label("mention_count"),
@@ -179,16 +179,16 @@ async def get_trending(
 
 
 @app.get("/api/ticker/{symbol}", response_model=TickerDetail)
-async def get_ticker(
+def get_ticker(
     symbol: str,
     hours: int = 24,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ):
     """Aggregated sentiment metrics for a single ticker."""
     symbol = symbol.upper()
     since = datetime.utcnow() - timedelta(hours=hours)
 
-    result = await db.execute(
+    result = db.execute(
         select(Post.sentiment_score, Post.sentiment_label)
         .join(Mention, Mention.post_id == Post.id)
         .where(Mention.ticker == symbol)
@@ -219,17 +219,17 @@ async def get_ticker(
 
 
 @app.get("/api/mentions/{symbol}", response_model=list[MentionItem])
-async def get_mentions(
+def get_mentions(
     symbol: str,
     limit: int = 50,
     hours: int = 24,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ):
     """Recent posts mentioning *symbol*."""
     symbol = symbol.upper()
     since = datetime.utcnow() - timedelta(hours=hours)
 
-    result = await db.execute(
+    result = db.execute(
         select(
             Mention.id,
             Mention.ticker,
@@ -266,9 +266,9 @@ async def get_mentions(
 
 
 @app.get("/api/alerts", response_model=list[AlertResponse])
-async def get_alerts(db: AsyncSession = Depends(get_db)):
+def get_alerts(db: Session = Depends(get_db)):
     """List all alert rules."""
-    result = await db.execute(select(Alert).order_by(desc(Alert.created_at)))
+    result = db.execute(select(Alert).order_by(desc(Alert.created_at)))
     alerts = result.scalars().all()
     return [
         AlertResponse(
@@ -286,7 +286,7 @@ async def get_alerts(db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/alerts", response_model=AlertResponse, status_code=201)
-async def create_alert(body: AlertCreate, db: AsyncSession = Depends(get_db)):
+def create_alert(body: AlertCreate, db: Session = Depends(get_db)):
     """Create a new alert rule."""
     valid_conditions = {"mention_spike", "sentiment_bullish", "sentiment_bearish"}
     if body.condition not in valid_conditions:
@@ -302,8 +302,8 @@ async def create_alert(body: AlertCreate, db: AsyncSession = Depends(get_db)):
         webhook_url=body.webhook_url,
     )
     db.add(alert)
-    await db.commit()
-    await db.refresh(alert)
+    db.commit()
+    db.refresh(alert)
 
     return AlertResponse(
         id=alert.id,
@@ -318,10 +318,10 @@ async def create_alert(body: AlertCreate, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/alerts/test", response_model=AlertTestResult)
-async def test_alert(
+def test_alert(
     body: AlertCreate,
     background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ):
     """
     Evaluate an alert rule against current data without persisting it.
@@ -338,7 +338,7 @@ async def test_alert(
     reason = ""
 
     if body.condition == "mention_spike":
-        result = await db.execute(
+        result = db.execute(
             select(func.count(Mention.id))
             .join(Post, Mention.post_id == Post.id)
             .where(Mention.ticker == ticker)
@@ -352,7 +352,7 @@ async def test_alert(
         )
 
     elif body.condition in ("sentiment_bullish", "sentiment_bearish"):
-        result = await db.execute(
+        result = db.execute(
             select(func.avg(Post.sentiment_score))
             .join(Mention, Mention.post_id == Post.id)
             .where(Mention.ticker == ticker)
@@ -404,23 +404,23 @@ async def test_alert(
 # Scrape triggers
 # ---------------------------------------------------------------------------
 
-async def _run_reddit():
-    await RedditScraper().scrape()
+def _run_reddit():
+    RedditScraper().scrape()
 
 
-async def _run_stocktwits():
-    await StockTwitsScraper().scrape()
+def _run_stocktwits():
+    StockTwitsScraper().scrape()
 
 
 @app.post("/api/scrape/reddit", response_model=ScrapeResult)
-async def scrape_reddit(background_tasks: BackgroundTasks):
+def scrape_reddit(background_tasks: BackgroundTasks):
     """Trigger a Reddit scrape in the background."""
     background_tasks.add_task(_run_reddit)
     return ScrapeResult(status="accepted", message="Reddit scrape started")
 
 
 @app.post("/api/scrape/stocktwits", response_model=ScrapeResult)
-async def scrape_stocktwits(background_tasks: BackgroundTasks):
+def scrape_stocktwits(background_tasks: BackgroundTasks):
     """Trigger a StockTwits scrape in the background."""
     background_tasks.add_task(_run_stocktwits)
     return ScrapeResult(status="accepted", message="StockTwits scrape started")
