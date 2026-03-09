@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
+import yfinance as yf
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,6 +20,32 @@ from app.workers.stocktwits_scraper import StockTwitsScraper
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Price cache  (ticker -> (price, pct_change, fetched_at))
+# ---------------------------------------------------------------------------
+
+_price_cache: dict[str, tuple[float, float, datetime]] = {}
+_PRICE_TTL = timedelta(minutes=5)
+
+
+def _get_price(ticker: str) -> tuple[Optional[float], Optional[float]]:
+    """Return (price, pct_change) for *ticker*, using a 5-minute in-memory cache."""
+    now = datetime.utcnow()
+    cached = _price_cache.get(ticker)
+    if cached and (now - cached[2]) < _PRICE_TTL:
+        return cached[0], cached[1]
+
+    try:
+        info = yf.Ticker(ticker).fast_info
+        price = float(info.last_price) if info.last_price else None
+        prev_close = float(info.previous_close) if info.previous_close else None
+        pct = round((price - prev_close) / prev_close * 100, 2) if price and prev_close else None
+        _price_cache[ticker] = (price, pct, now)
+        return price, pct
+    except Exception:
+        logger.warning("Could not fetch price for %s", ticker)
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +99,8 @@ class TrendingItem(BaseModel):
     mention_count: int
     avg_sentiment: float
     sentiment_label: str
+    price: Optional[float]
+    percent_change: Optional[float]
 
 
 class TickerDetail(BaseModel):
@@ -181,15 +210,18 @@ def get_trending(
     )
     rows = result.all()
 
-    return [
-        TrendingItem(
+    items = []
+    for row in rows:
+        price, pct = _get_price(row.ticker)
+        items.append(TrendingItem(
             ticker=row.ticker,
             mention_count=row.mention_count,
             avg_sentiment=round(row.avg_sentiment or 0.0, 4),
             sentiment_label=_sentiment_label(row.avg_sentiment or 0.0),
-        )
-        for row in rows
-    ]
+            price=price,
+            percent_change=pct,
+        ))
+    return items
 
 
 @app.get("/api/ticker/{symbol}", response_model=TickerDetail)
