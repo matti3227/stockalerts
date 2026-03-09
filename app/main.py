@@ -438,3 +438,45 @@ def scrape_stocktwits(background_tasks: BackgroundTasks):
     """Trigger a StockTwits scrape in the background."""
     background_tasks.add_task(_run_stocktwits)
     return ScrapeResult(status="accepted", message="StockTwits scrape started")
+
+
+@app.post("/api/scrape/test")
+def scrape_test(db: Session = Depends(get_db)):
+    """Run the StockTwits scraper synchronously and report what was stored."""
+    posts_before = db.execute(select(func.count(Post.id))).scalar() or 0
+    mentions_before = db.execute(select(func.count(Mention.id))).scalar() or 0
+
+    error = None
+    new_posts = 0
+    try:
+        new_posts = StockTwitsScraper().scrape()
+    except Exception as exc:
+        logger.exception("scrape/test failed")
+        error = str(exc)
+
+    posts_after = db.execute(select(func.count(Post.id))).scalar() or 0
+    mentions_after = db.execute(select(func.count(Mention.id))).scalar() or 0
+
+    return {
+        "status": "error" if error else "ok",
+        "new_posts_saved": new_posts,
+        "posts_delta": posts_after - posts_before,
+        "mentions_delta": mentions_after - mentions_before,
+        "total_posts": posts_after,
+        "total_mentions": mentions_after,
+        "error": error,
+    }
+
+
+@app.get("/api/debug/db-status")
+def db_status(db: Session = Depends(get_db)):
+    """Return total counts for posts, mentions, and distinct tickers."""
+    total_posts = db.execute(select(func.count(Post.id))).scalar() or 0
+    total_mentions = db.execute(select(func.count(Mention.id))).scalar() or 0
+    total_tickers = db.execute(select(func.count(func.distinct(Mention.ticker)))).scalar() or 0
+
+    return {
+        "total_posts": total_posts,
+        "total_mentions": total_mentions,
+        "total_tickers": total_tickers,
+    }
