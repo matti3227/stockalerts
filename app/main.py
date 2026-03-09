@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from app.database import get_db, init_db
 from app.models.schemas import Alert, Mention, Post, TickerMetric
 from app.workers.reddit_scraper import RedditScraper
@@ -27,7 +29,19 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database tables ready")
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_run_stocktwits, "interval", minutes=5, id="stocktwits")
+    scheduler.start()
+    logger.info("Scheduler started — StockTwits scrape every 5 minutes")
+
+    # Run once immediately so data is available right after deploy
+    _run_stocktwits()
+
     yield
+
+    scheduler.shutdown(wait=False)
+    logger.info("Scheduler stopped")
 
 
 # ---------------------------------------------------------------------------

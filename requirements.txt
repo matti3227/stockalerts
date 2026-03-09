@@ -8,3 +8,4 @@ vaderSentiment==3.3.2
 python-dotenv==1.0.1
 pydantic-settings==2.5.2
 alembic==1.13.3
+apscheduler==3.10.4
