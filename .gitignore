@@ -1,1 +1,29 @@
+# Virtual environment
 .venv/
+
+# Environment secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Alembic versions auto-generated; keep in repo if you want migration history
+# alembic/versions/
+
+# OS
+.DS_Store
+Thumbs.db
