@@ -60,9 +60,11 @@ class StockTwitsScraper:
             )
             resp.raise_for_status()
             symbols = resp.json().get("symbols", [])
-            return [s["symbol"] for s in symbols[:20]]
+            tickers = [s["symbol"] for s in symbols[:20]]
+            logger.info("StockTwits trending: fetched %d tickers: %s", len(tickers), tickers)
+            return tickers
         except Exception:
-            logger.warning("Could not fetch trending symbols, using defaults")
+            logger.warning("Could not fetch trending symbols, using defaults: %s", DEFAULT_TICKERS)
             return DEFAULT_TICKERS
 
     def _get_symbol_stream(self, client: httpx.Client, ticker: str) -> list[dict]:
@@ -74,9 +76,14 @@ class StockTwitsScraper:
                 timeout=10.0,
             )
             resp.raise_for_status()
-            return resp.json().get("messages", [])
+            messages = resp.json().get("messages", [])
+            logger.info("StockTwits %s: received %d messages", ticker, len(messages))
+            return messages
         except httpx.HTTPStatusError as exc:
-            logger.warning("StockTwits %s returned %s", ticker, exc.response.status_code)
+            logger.warning(
+                "StockTwits %s returned HTTP %s: %s",
+                ticker, exc.response.status_code, exc.response.text[:200],
+            )
             return []
         except Exception:
             logger.exception("Error fetching StockTwits stream for %s", ticker)
@@ -94,15 +101,19 @@ class StockTwitsScraper:
                 if not messages:
                     continue
 
-                try:
-                    with SessionLocal() as db:
-                        for msg in messages:
-                            external_id = f"stocktwits_{msg['id']}"
+                saved = skipped = errors = 0
 
-                            result = db.execute(
+                for msg in messages:
+                    try:
+                        external_id = f"stocktwits_{msg['id']}"
+
+                        with SessionLocal() as db:
+                            existing = db.execute(
                                 select(Post).where(Post.external_id == external_id)
-                            )
-                            if result.scalar_one_or_none():
+                            ).scalar_one_or_none()
+
+                            if existing:
+                                skipped += 1
                                 continue
 
                             body = msg.get("body", "")
@@ -141,12 +152,21 @@ class StockTwitsScraper:
                                     context=body[:500],
                                 )
                             )
+                            db.commit()
+                            saved += 1
                             total += 1
 
-                        db.commit()
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist StockTwits message id=%s for %s",
+                            msg.get("id"), ticker,
+                        )
+                        errors += 1
 
-                except Exception:
-                    logger.exception("Failed to persist StockTwits data for %s", ticker)
+                logger.info(
+                    "StockTwits %s: saved=%d skipped=%d errors=%d",
+                    ticker, saved, skipped, errors,
+                )
 
         logger.info("StockTwits scrape complete — %d new posts saved", total)
         return total
