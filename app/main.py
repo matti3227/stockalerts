@@ -5,8 +5,6 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-import pandas as pd
-import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,13 +18,6 @@ from app.models import Alert, CongressionalTrade, DarkPool, Mention, Post
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Price cache
-# ---------------------------------------------------------------------------
-
-_price_cache: dict[str, tuple[Optional[float], Optional[float], datetime]] = {}
-_PRICE_TTL = timedelta(minutes=5)
-
 _FILTER_MAP = {
     "15m":  timedelta(minutes=15),
     "1h":   timedelta(hours=1),
@@ -34,75 +25,6 @@ _FILTER_MAP = {
     "24h":  timedelta(hours=24),
     "7d":   timedelta(days=7),
 }
-
-
-def _clean(val) -> Optional[float]:
-    try:
-        f = float(val)
-        return None if math.isnan(f) else f
-    except Exception:
-        return None
-
-
-def _batch_fetch_prices(
-    tickers: list[str],
-) -> dict[str, tuple[Optional[float], Optional[float]]]:
-    now = datetime.utcnow()
-    result: dict[str, tuple[Optional[float], Optional[float]]] = {}
-    to_fetch: list[str] = []
-
-    for t in tickers:
-        cached = _price_cache.get(t)
-        if cached and (now - cached[2]) < _PRICE_TTL:
-            result[t] = (cached[0], cached[1])
-        else:
-            to_fetch.append(t)
-
-    if not to_fetch:
-        return result
-
-    try:
-        data = yf.download(
-            tickers=to_fetch,
-            period="2d",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
-        if isinstance(data.columns, pd.MultiIndex):
-            close = data["Close"]
-        else:
-            close = data[["Close"]].rename(columns={"Close": to_fetch[0]})
-
-        for ticker in to_fetch:
-            try:
-                series = (
-                    close[ticker].dropna()
-                    if ticker in close.columns
-                    else pd.Series([], dtype=float)
-                )
-                if len(series) >= 2:
-                    price = _clean(series.iloc[-1])
-                    prev  = _clean(series.iloc[-2])
-                    pct   = round((price - prev) / prev * 100, 2) if price and prev else None
-                elif len(series) == 1:
-                    price = _clean(series.iloc[-1])
-                    pct   = None
-                else:
-                    price, pct = None, None
-            except Exception:
-                price, pct = None, None
-
-            _price_cache[ticker] = (price, pct, now)
-            result[ticker] = (price, pct)
-
-    except Exception:
-        logger.exception("yfinance batch download failed for %s", to_fetch)
-        for t in to_fetch:
-            result[t] = (None, None)
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +101,6 @@ class TrendingItem(BaseModel):
     sentiment_label: str
     sentiment_confidence: float
     trending_score: float
-    price: Optional[float]
-    percent_change: Optional[float]
     congressional_activity: bool     # any congressional trade in last 30 days
 
 
@@ -207,8 +127,6 @@ class TickerDetail(BaseModel):
     sources: list[str]
     congressional_trades: list[CongressionalItem]
     dark_pool_volume: Optional[int]
-    price: Optional[float]
-    percent_change: Optional[float]
 
 
 class MentionItem(BaseModel):
@@ -329,19 +247,16 @@ def get_trending(
     if not rows:
         return []
 
-    tickers          = [r.ticker for r in rows]
-    prices           = _batch_fetch_prices(tickers)
-    cong_active      = _congressional_tickers_last_30d(db)
+    cong_active = _congressional_tickers_last_30d(db)
 
     result = []
     for row in rows:
-        mention_count = row.mention_count
-        velocity      = round(mention_count / window_hours, 4)
-        raw_score     = row.raw_score or 0.0
+        mention_count  = row.mention_count
+        velocity       = round(mention_count / window_hours, 4)
+        raw_score      = row.raw_score or 0.0
         trending_score = round(raw_score * (1.0 + math.log1p(velocity)), 4)
-        avg_s         = row.avg_sentiment or 0.0
-        avg_conf      = row.avg_confidence or 0.5
-        price, pct    = prices.get(row.ticker, (None, None))
+        avg_s          = row.avg_sentiment or 0.0
+        avg_conf       = row.avg_confidence or 0.5
 
         result.append(TrendingItem(
             ticker=row.ticker,
@@ -351,8 +266,6 @@ def get_trending(
             sentiment_label=_sentiment_label(avg_s),
             sentiment_confidence=round(avg_conf, 4),
             trending_score=trending_score,
-            price=price,
-            percent_change=pct,
             congressional_activity=row.ticker in cong_active,
         ))
 
@@ -422,8 +335,6 @@ def get_ticker(
         .limit(1)
     ).scalar_one_or_none()
 
-    price, pct = _batch_fetch_prices([symbol]).get(symbol, (None, None))
-
     return TickerDetail(
         ticker=symbol,
         mention_count=n,
@@ -436,8 +347,6 @@ def get_ticker(
         sources=sources,
         congressional_trades=cong_items,
         dark_pool_volume=dp_row,
-        price=price,
-        percent_change=pct,
     )
 
 
