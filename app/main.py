@@ -1,38 +1,42 @@
+"""Stock Alerts API — main FastAPI application."""
 import logging
 import math
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
-import httpx
 import pandas as pd
 import yfinance as yf
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from apscheduler.schedulers.background import BackgroundScheduler
-
 from app.database import get_db, init_db
-from app.models.schemas import Alert, Mention, Post, TickerMetric
-from app.workers.reddit_scraper import RedditScraper
-from app.workers.stocktwits_scraper import StockTwitsScraper
+from app.models import Alert, CongressionalTrade, DarkPool, Mention, Post
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Price cache  (ticker -> (price, pct_change, fetched_at))
+# Price cache
 # ---------------------------------------------------------------------------
 
 _price_cache: dict[str, tuple[Optional[float], Optional[float], datetime]] = {}
 _PRICE_TTL = timedelta(minutes=5)
 
+_FILTER_MAP = {
+    "15m":  timedelta(minutes=15),
+    "1h":   timedelta(hours=1),
+    "4h":   timedelta(hours=4),
+    "24h":  timedelta(hours=24),
+    "7d":   timedelta(days=7),
+}
+
 
 def _clean(val) -> Optional[float]:
-    """Convert a yfinance value to float, returning None for NaN/None."""
     try:
         f = float(val)
         return None if math.isnan(f) else f
@@ -43,7 +47,6 @@ def _clean(val) -> Optional[float]:
 def _batch_fetch_prices(
     tickers: list[str],
 ) -> dict[str, tuple[Optional[float], Optional[float]]]:
-    """Fetch price + daily % change for all tickers in one yfinance call."""
     now = datetime.utcnow()
     result: dict[str, tuple[Optional[float], Optional[float]]] = {}
     to_fetch: list[str] = []
@@ -59,7 +62,6 @@ def _batch_fetch_prices(
         return result
 
     try:
-        logger.info("Fetching prices for: %s", to_fetch)
         data = yf.download(
             tickers=to_fetch,
             period="2d",
@@ -68,7 +70,6 @@ def _batch_fetch_prices(
             progress=False,
             threads=False,
         )
-        # Multi-ticker download returns a MultiIndex DataFrame; single-ticker is flat.
         if isinstance(data.columns, pd.MultiIndex):
             close = data["Close"]
         else:
@@ -76,7 +77,11 @@ def _batch_fetch_prices(
 
         for ticker in to_fetch:
             try:
-                series = close[ticker].dropna() if ticker in close.columns else pd.Series([], dtype=float)
+                series = (
+                    close[ticker].dropna()
+                    if ticker in close.columns
+                    else pd.Series([], dtype=float)
+                )
                 if len(series) >= 2:
                     price = _clean(series.iloc[-1])
                     prev  = _clean(series.iloc[-2])
@@ -87,10 +92,8 @@ def _batch_fetch_prices(
                 else:
                     price, pct = None, None
             except Exception:
-                logger.exception("Error extracting price for %s", ticker)
                 price, pct = None, None
 
-            logger.info("Price %s: price=%s pct=%s", ticker, price, pct)
             _price_cache[ticker] = (price, pct, now)
             result[ticker] = (price, pct)
 
@@ -103,21 +106,41 @@ def _batch_fetch_prices(
 
 
 # ---------------------------------------------------------------------------
+# Background jobs
+# ---------------------------------------------------------------------------
+
+def _run(name: str, fn):
+    try:
+        count = fn()
+        logger.info("%s scrape complete — %d new records", name, count)
+    except Exception:
+        logger.exception("%s scrape raised an unhandled exception", name)
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    logger.info("Database tables ready")
+    logger.info("Database ready")
+
+    from app.workers import congressional, dark_pools, news, reddit, stocktwits
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(_run_stocktwits, "interval", minutes=5, id="stocktwits")
+    scheduler.add_job(lambda: _run("StockTwits",   stocktwits.scrape),   "interval", minutes=5,    id="stocktwits")
+    scheduler.add_job(lambda: _run("Reddit",       reddit.scrape),       "interval", minutes=20,   id="reddit")
+    scheduler.add_job(lambda: _run("News",         news.scrape),         "interval", minutes=10,   id="news")
+    scheduler.add_job(lambda: _run("Congressional",congressional.scrape),"interval", hours=6,      id="congressional")
+    scheduler.add_job(lambda: _run("DarkPool",     dark_pools.scrape),   "interval", hours=24,     id="dark_pools")
     scheduler.start()
-    logger.info("Scheduler started — StockTwits scrape every 5 minutes")
+    logger.info("Scheduler started")
 
-    # Run once immediately so data is available right after deploy
-    _run_stocktwits()
+    # Seed data immediately on startup
+    _run("StockTwits",    stocktwits.scrape)
+    _run("Congressional", congressional.scrape)
+    _run("DarkPool",      dark_pools.scrape)
 
     yield
 
@@ -131,8 +154,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Stock Alerts API",
-    version="1.0.0",
-    description="Real-time stock sentiment analysis from Reddit and StockTwits.",
+    version="2.0.0",
+    description="Real-time stock sentiment from Reddit, StockTwits, news, congressional trades, and dark pools.",
     lifespan=lifespan,
 )
 
@@ -145,44 +168,74 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Pydantic schemas (request / response)
+# Pydantic models
 # ---------------------------------------------------------------------------
 
 class TrendingItem(BaseModel):
     ticker: str
     mention_count: int
+    velocity: float                  # mentions per hour in the window
     avg_sentiment: float
     sentiment_label: str
+    sentiment_confidence: float
+    trending_score: float
     price: Optional[float]
     percent_change: Optional[float]
+    congressional_activity: bool     # any congressional trade in last 30 days
+
+
+class CongressionalItem(BaseModel):
+    politician: str
+    chamber: str
+    party: str
+    ticker: str
+    buy_sell: str
+    amount: str
+    trade_date: Optional[date]
+    disclosure_date: Optional[date]
 
 
 class TickerDetail(BaseModel):
     ticker: str
     mention_count: int
     avg_sentiment: float
+    sentiment_label: str
     bullish_count: int
     bearish_count: int
     neutral_count: int
-    calculated_at: datetime
+    avg_confidence: float
+    sources: list[str]
+    congressional_trades: list[CongressionalItem]
+    dark_pool_volume: Optional[int]
+    price: Optional[float]
+    percent_change: Optional[float]
 
 
 class MentionItem(BaseModel):
     id: int
     ticker: str
-    content: str
+    text: str
     source: str
     author: str
     sentiment_score: float
     sentiment_label: str
+    sentiment_confidence: float
     url: Optional[str]
     created_at: datetime
 
 
+class DarkPoolItem(BaseModel):
+    ticker: str
+    volume: int
+    short_volume: Optional[int]
+    total_volume: Optional[int]
+    dark_pct: Optional[float]
+    timestamp: datetime
+
+
 class AlertCreate(BaseModel):
     ticker: str
-    # mention_spike | sentiment_bullish | sentiment_bearish
-    condition: str
+    alert_type: str        # mention_spike | bullish | bearish
     threshold: float
     webhook_url: Optional[str] = None
 
@@ -190,26 +243,12 @@ class AlertCreate(BaseModel):
 class AlertResponse(BaseModel):
     id: int
     ticker: str
-    condition: str
+    alert_type: str
     threshold: float
-    is_active: bool
-    webhook_url: Optional[str]
-    last_triggered: Optional[datetime]
-    created_at: datetime
-
-
-class ScrapeResult(BaseModel):
     status: str
-    message: str
-
-
-class AlertTestResult(BaseModel):
-    ticker: str
-    condition: str
-    threshold: float
-    current_value: float
-    triggered: bool
-    reason: str
+    webhook_url: Optional[str]
+    created_at: datetime
+    triggered_at: Optional[datetime]
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +263,15 @@ def _sentiment_label(score: float) -> str:
     return "neutral"
 
 
-def _trigger_webhook(url: str, payload: dict) -> None:
-    try:
-        with httpx.Client(timeout=10.0) as client:
-            client.post(url, json=payload)
-    except Exception:
-        logger.exception("Webhook delivery failed: %s", url)
+def _congressional_tickers_last_30d(db: Session) -> set[str]:
+    """Return set of tickers with a congressional trade in the last 30 days."""
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    rows = db.execute(
+        select(CongressionalTrade.ticker)
+        .where(CongressionalTrade.trade_date >= cutoff.date())
+        .distinct()
+    ).scalars().all()
+    return set(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -237,47 +279,84 @@ def _trigger_webhook(url: str, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "timestamp": datetime.utcnow()}
+def health(db: Session = Depends(get_db)):
+    posts    = db.execute(select(func.count(Post.id))).scalar() or 0
+    mentions = db.execute(select(func.count(Mention.id))).scalar() or 0
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow(),
+        "db_posts": posts,
+        "db_mentions": mentions,
+    }
 
 
 @app.get("/api/trending", response_model=list[TrendingItem])
 def get_trending(
-    limit: int = 10,
-    hours: int = 24,
+    filter: str = "24h",
+    limit: int = 50,
     db: Session = Depends(get_db),
 ):
-    """Top tickers by mention count over the last *hours* hours."""
-    since = datetime.utcnow() - timedelta(hours=hours)
+    """Top tickers ranked by a quality-weighted trending score.
 
-    result = db.execute(
+    Score = SUM((1 + log(1+engagement)) * (1 + confidence*0.5)) * (1 + log(1+velocity))
+    where velocity = mention_count / window_hours
+    """
+    window       = _FILTER_MAP.get(filter, timedelta(hours=24))
+    since        = datetime.utcnow() - window
+    window_hours = max(window.total_seconds() / 3600, 0.25)
+
+    # Per-ticker aggregation
+    raw_score_expr = func.sum(
+        (1.0 + func.log(func.greatest(Post.engagement, 0) + 1.0))
+        * (1.0 + func.coalesce(Mention.sentiment_confidence, 0.5) * 0.5)
+    ).label("raw_score")
+
+    rows = db.execute(
         select(
             Mention.ticker,
             func.count(Mention.id).label("mention_count"),
-            func.avg(Post.sentiment_score).label("avg_sentiment"),
+            func.avg(Mention.sentiment_score).label("avg_sentiment"),
+            func.avg(Mention.sentiment_confidence).label("avg_confidence"),
+            raw_score_expr,
         )
         .join(Post, Mention.post_id == Post.id)
-        .where(Post.created_at >= since)
+        .where(Mention.created_at >= since)
         .group_by(Mention.ticker)
-        .order_by(desc("mention_count"))
+        .order_by(desc("raw_score"))
         .limit(limit)
-    )
-    rows = result.all()
+    ).all()
 
-    tickers = [row.ticker for row in rows]
-    prices = _batch_fetch_prices(tickers)
+    if not rows:
+        return []
 
-    return [
-        TrendingItem(
+    tickers          = [r.ticker for r in rows]
+    prices           = _batch_fetch_prices(tickers)
+    cong_active      = _congressional_tickers_last_30d(db)
+
+    result = []
+    for row in rows:
+        mention_count = row.mention_count
+        velocity      = round(mention_count / window_hours, 4)
+        raw_score     = row.raw_score or 0.0
+        trending_score = round(raw_score * (1.0 + math.log1p(velocity)), 4)
+        avg_s         = row.avg_sentiment or 0.0
+        avg_conf      = row.avg_confidence or 0.5
+        price, pct    = prices.get(row.ticker, (None, None))
+
+        result.append(TrendingItem(
             ticker=row.ticker,
-            mention_count=row.mention_count,
-            avg_sentiment=round(row.avg_sentiment or 0.0, 4),
-            sentiment_label=_sentiment_label(row.avg_sentiment or 0.0),
-            price=prices.get(row.ticker, (None, None))[0],
-            percent_change=prices.get(row.ticker, (None, None))[1],
-        )
-        for row in rows
-    ]
+            mention_count=mention_count,
+            velocity=velocity,
+            avg_sentiment=round(avg_s, 4),
+            sentiment_label=_sentiment_label(avg_s),
+            sentiment_confidence=round(avg_conf, 4),
+            trending_score=trending_score,
+            price=price,
+            percent_change=pct,
+            congressional_activity=row.ticker in cong_active,
+        ))
+
+    return result
 
 
 @app.get("/api/ticker/{symbol}", response_model=TickerDetail)
@@ -286,80 +365,122 @@ def get_ticker(
     hours: int = 24,
     db: Session = Depends(get_db),
 ):
-    """Aggregated sentiment metrics for a single ticker."""
     symbol = symbol.upper()
-    since = datetime.utcnow() - timedelta(hours=hours)
+    since  = datetime.utcnow() - timedelta(hours=hours)
 
-    result = db.execute(
-        select(Post.sentiment_score, Post.sentiment_label)
-        .join(Mention, Mention.post_id == Post.id)
+    rows = db.execute(
+        select(
+            Mention.sentiment_score,
+            Mention.sentiment_label,
+            Mention.sentiment_confidence,
+            Post.source,
+        )
+        .join(Post, Mention.post_id == Post.id)
         .where(Mention.ticker == symbol)
-        .where(Post.created_at >= since)
-    )
-    rows = result.all()
+        .where(Mention.created_at >= since)
+    ).all()
 
     if not rows:
-        raise HTTPException(
-            status_code=404, detail=f"No data found for {symbol} in the last {hours}h"
-        )
+        raise HTTPException(status_code=404, detail=f"No data for {symbol} in last {hours}h")
 
-    mention_count = len(rows)
-    avg_sentiment = sum(r.sentiment_score or 0.0 for r in rows) / mention_count
+    n             = len(rows)
+    avg_s         = sum(r.sentiment_score or 0.0 for r in rows) / n
+    avg_conf      = sum(r.sentiment_confidence or 0.5 for r in rows) / n
     bullish_count = sum(1 for r in rows if r.sentiment_label == "bullish")
     bearish_count = sum(1 for r in rows if r.sentiment_label == "bearish")
-    neutral_count = mention_count - bullish_count - bearish_count
+    sources       = list({r.source for r in rows})
+
+    # Congressional trades for this ticker (last 90 days)
+    cutoff = datetime.utcnow() - timedelta(days=90)
+    cong_rows = db.execute(
+        select(CongressionalTrade)
+        .where(CongressionalTrade.ticker == symbol)
+        .where(CongressionalTrade.trade_date >= cutoff.date())
+        .order_by(desc(CongressionalTrade.trade_date))
+        .limit(20)
+    ).scalars().all()
+
+    cong_items = [
+        CongressionalItem(
+            politician=c.politician,
+            chamber=c.chamber or "",
+            party=c.party or "",
+            ticker=c.ticker,
+            buy_sell=c.buy_sell,
+            amount=c.amount or "",
+            trade_date=c.trade_date,
+            disclosure_date=c.disclosure_date,
+        )
+        for c in cong_rows
+    ]
+
+    # Latest dark pool reading for this ticker
+    dp_row = db.execute(
+        select(DarkPool.volume)
+        .where(DarkPool.ticker == symbol)
+        .order_by(desc(DarkPool.timestamp))
+        .limit(1)
+    ).scalar_one_or_none()
+
+    price, pct = _batch_fetch_prices([symbol]).get(symbol, (None, None))
 
     return TickerDetail(
         ticker=symbol,
-        mention_count=mention_count,
-        avg_sentiment=round(avg_sentiment, 4),
+        mention_count=n,
+        avg_sentiment=round(avg_s, 4),
+        sentiment_label=_sentiment_label(avg_s),
         bullish_count=bullish_count,
         bearish_count=bearish_count,
-        neutral_count=neutral_count,
-        calculated_at=datetime.utcnow(),
+        neutral_count=n - bullish_count - bearish_count,
+        avg_confidence=round(avg_conf, 4),
+        sources=sources,
+        congressional_trades=cong_items,
+        dark_pool_volume=dp_row,
+        price=price,
+        percent_change=pct,
     )
 
 
 @app.get("/api/mentions/{symbol}", response_model=list[MentionItem])
 def get_mentions(
     symbol: str,
-    limit: int = 50,
     hours: int = 24,
+    limit: int = 50,
     db: Session = Depends(get_db),
 ):
-    """Recent posts mentioning *symbol*."""
     symbol = symbol.upper()
-    since = datetime.utcnow() - timedelta(hours=hours)
+    since  = datetime.utcnow() - timedelta(hours=hours)
 
-    result = db.execute(
+    rows = db.execute(
         select(
             Mention.id,
             Mention.ticker,
-            Post.content,
+            Post.text,
             Post.source,
             Post.author,
-            Post.sentiment_score,
-            Post.sentiment_label,
+            Mention.sentiment_score,
+            Mention.sentiment_label,
+            Mention.sentiment_confidence,
             Post.url,
-            Post.created_at,
+            Mention.created_at,
         )
         .join(Post, Mention.post_id == Post.id)
         .where(Mention.ticker == symbol)
-        .where(Post.created_at >= since)
-        .order_by(desc(Post.created_at))
+        .where(Mention.created_at >= since)
+        .order_by(desc(Mention.created_at))
         .limit(limit)
-    )
-    rows = result.all()
+    ).all()
 
     return [
         MentionItem(
             id=r.id,
             ticker=r.ticker,
-            content=r.content,
+            text=r.text,
             source=r.source,
-            author=r.author,
+            author=r.author or "",
             sentiment_score=round(r.sentiment_score or 0.0, 4),
             sentiment_label=r.sentiment_label or "neutral",
+            sentiment_confidence=round(r.sentiment_confidence or 0.5, 4),
             url=r.url,
             created_at=r.created_at,
         )
@@ -367,209 +488,145 @@ def get_mentions(
     ]
 
 
+@app.get("/api/congressional", response_model=list[CongressionalItem])
+def get_congressional(
+    days: int = 30,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    rows = db.execute(
+        select(CongressionalTrade)
+        .where(CongressionalTrade.trade_date >= cutoff.date())
+        .order_by(desc(CongressionalTrade.disclosure_date), desc(CongressionalTrade.trade_date))
+        .limit(limit)
+    ).scalars().all()
+
+    return [
+        CongressionalItem(
+            politician=r.politician,
+            chamber=r.chamber or "",
+            party=r.party or "",
+            ticker=r.ticker,
+            buy_sell=r.buy_sell,
+            amount=r.amount or "",
+            trade_date=r.trade_date,
+            disclosure_date=r.disclosure_date,
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/congressional/{ticker}", response_model=list[CongressionalItem])
+def get_congressional_ticker(
+    ticker: str,
+    days: int = 180,
+    db: Session = Depends(get_db),
+):
+    ticker = ticker.upper()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    rows = db.execute(
+        select(CongressionalTrade)
+        .where(CongressionalTrade.ticker == ticker)
+        .where(CongressionalTrade.trade_date >= cutoff.date())
+        .order_by(desc(CongressionalTrade.trade_date))
+        .limit(100)
+    ).scalars().all()
+
+    return [
+        CongressionalItem(
+            politician=r.politician,
+            chamber=r.chamber or "",
+            party=r.party or "",
+            ticker=r.ticker,
+            buy_sell=r.buy_sell,
+            amount=r.amount or "",
+            trade_date=r.trade_date,
+            disclosure_date=r.disclosure_date,
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/dark-pools", response_model=list[DarkPoolItem])
+def get_dark_pools(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    # Return tickers with the highest dark-pool volume from the latest data week
+    latest_ts = db.execute(
+        select(func.max(DarkPool.timestamp))
+    ).scalar_one_or_none()
+
+    if not latest_ts:
+        return []
+
+    rows = db.execute(
+        select(DarkPool)
+        .where(DarkPool.timestamp == latest_ts)
+        .order_by(desc(DarkPool.volume))
+        .limit(limit)
+    ).scalars().all()
+
+    return [
+        DarkPoolItem(
+            ticker=r.ticker,
+            volume=r.volume,
+            short_volume=r.short_volume,
+            total_volume=r.total_volume,
+            dark_pct=r.dark_pct,
+            timestamp=r.timestamp,
+        )
+        for r in rows
+    ]
+
+
 @app.get("/api/alerts", response_model=list[AlertResponse])
 def get_alerts(db: Session = Depends(get_db)):
-    """List all alert rules."""
-    result = db.execute(select(Alert).order_by(desc(Alert.created_at)))
-    alerts = result.scalars().all()
+    rows = db.execute(select(Alert).order_by(desc(Alert.created_at))).scalars().all()
     return [
         AlertResponse(
-            id=a.id,
-            ticker=a.ticker,
-            condition=a.condition,
-            threshold=a.threshold,
-            is_active=a.is_active,
-            webhook_url=a.webhook_url,
-            last_triggered=a.last_triggered,
-            created_at=a.created_at,
+            id=r.id,
+            ticker=r.ticker,
+            alert_type=r.alert_type,
+            threshold=r.threshold,
+            status=r.status,
+            webhook_url=r.webhook_url,
+            created_at=r.created_at,
+            triggered_at=r.triggered_at,
         )
-        for a in alerts
+        for r in rows
     ]
 
 
 @app.post("/api/alerts", response_model=AlertResponse, status_code=201)
 def create_alert(body: AlertCreate, db: Session = Depends(get_db)):
-    """Create a new alert rule."""
-    valid_conditions = {"mention_spike", "sentiment_bullish", "sentiment_bearish"}
-    if body.condition not in valid_conditions:
-        raise HTTPException(
-            status_code=422,
-            detail=f"condition must be one of: {', '.join(sorted(valid_conditions))}",
-        )
-
     alert = Alert(
         ticker=body.ticker.upper(),
-        condition=body.condition,
+        alert_type=body.alert_type,
         threshold=body.threshold,
         webhook_url=body.webhook_url,
+        status="active",
     )
     db.add(alert)
     db.commit()
     db.refresh(alert)
-
     return AlertResponse(
         id=alert.id,
         ticker=alert.ticker,
-        condition=alert.condition,
+        alert_type=alert.alert_type,
         threshold=alert.threshold,
-        is_active=alert.is_active,
+        status=alert.status,
         webhook_url=alert.webhook_url,
-        last_triggered=alert.last_triggered,
         created_at=alert.created_at,
+        triggered_at=alert.triggered_at,
     )
 
 
-@app.post("/api/alerts/test", response_model=AlertTestResult)
-def test_alert(
-    body: AlertCreate,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
-    """
-    Evaluate an alert rule against current data without persisting it.
-    Fires the webhook if triggered.
-    """
-    ticker = body.ticker.upper()
-    since = datetime.utcnow() - timedelta(hours=24)
-
-    # ------------------------------------------------------------------
-    # Evaluate condition
-    # ------------------------------------------------------------------
-    triggered = False
-    current_value = 0.0
-    reason = ""
-
-    if body.condition == "mention_spike":
-        result = db.execute(
-            select(func.count(Mention.id))
-            .join(Post, Mention.post_id == Post.id)
-            .where(Mention.ticker == ticker)
-            .where(Post.created_at >= since)
-        )
-        current_value = float(result.scalar() or 0)
-        triggered = current_value >= body.threshold
-        reason = (
-            f"{int(current_value)} mentions in the last 24 h "
-            f"(threshold: {int(body.threshold)})"
-        )
-
-    elif body.condition in ("sentiment_bullish", "sentiment_bearish"):
-        result = db.execute(
-            select(func.avg(Post.sentiment_score))
-            .join(Mention, Mention.post_id == Post.id)
-            .where(Mention.ticker == ticker)
-            .where(Post.created_at >= since)
-        )
-        avg = result.scalar()
-        current_value = round(float(avg or 0.0), 4)
-
-        if body.condition == "sentiment_bullish":
-            triggered = current_value >= body.threshold
-            reason = (
-                f"avg sentiment {current_value:.4f} "
-                f"(bullish threshold: {body.threshold})"
-            )
-        else:
-            triggered = current_value <= body.threshold
-            reason = (
-                f"avg sentiment {current_value:.4f} "
-                f"(bearish threshold: {body.threshold})"
-            )
-    else:
-        raise HTTPException(status_code=422, detail="Unknown condition")
-
-    # ------------------------------------------------------------------
-    # Fire webhook in the background if triggered
-    # ------------------------------------------------------------------
-    if triggered and body.webhook_url:
-        payload = {
-            "ticker": ticker,
-            "condition": body.condition,
-            "threshold": body.threshold,
-            "current_value": current_value,
-            "reason": reason,
-            "triggered_at": datetime.utcnow().isoformat(),
-        }
-        background_tasks.add_task(_trigger_webhook, body.webhook_url, payload)
-
-    return AlertTestResult(
-        ticker=ticker,
-        condition=body.condition,
-        threshold=body.threshold,
-        current_value=current_value,
-        triggered=triggered,
-        reason=reason,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Scrape triggers
-# ---------------------------------------------------------------------------
-
-def _run_reddit():
-    RedditScraper().scrape()
-
-
-def _run_stocktwits():
-    logger.info("Starting StockTwits scraper")
-    try:
-        count = StockTwitsScraper().scrape()
-        logger.info("Scraper completed: %d posts saved", count)
-    except Exception:
-        logger.exception("StockTwits scraper raised an unhandled exception")
-
-
-@app.post("/api/scrape/reddit", response_model=ScrapeResult)
-def scrape_reddit(background_tasks: BackgroundTasks):
-    """Trigger a Reddit scrape in the background."""
-    background_tasks.add_task(_run_reddit)
-    return ScrapeResult(status="accepted", message="Reddit scrape started")
-
-
-@app.post("/api/scrape/stocktwits", response_model=ScrapeResult)
-def scrape_stocktwits(background_tasks: BackgroundTasks):
-    """Trigger a StockTwits scrape in the background."""
-    background_tasks.add_task(_run_stocktwits)
-    return ScrapeResult(status="accepted", message="StockTwits scrape started")
-
-
-@app.post("/api/scrape/test")
-def scrape_test(db: Session = Depends(get_db)):
-    """Run the StockTwits scraper synchronously and report what was stored."""
-    posts_before = db.execute(select(func.count(Post.id))).scalar() or 0
-    mentions_before = db.execute(select(func.count(Mention.id))).scalar() or 0
-
-    error = None
-    new_posts = 0
-    try:
-        new_posts = StockTwitsScraper().scrape()
-    except Exception as exc:
-        logger.exception("scrape/test failed")
-        error = str(exc)
-
-    posts_after = db.execute(select(func.count(Post.id))).scalar() or 0
-    mentions_after = db.execute(select(func.count(Mention.id))).scalar() or 0
-
-    return {
-        "status": "error" if error else "ok",
-        "new_posts_saved": new_posts,
-        "posts_delta": posts_after - posts_before,
-        "mentions_delta": mentions_after - mentions_before,
-        "total_posts": posts_after,
-        "total_mentions": mentions_after,
-        "error": error,
-    }
-
-
-@app.get("/api/debug/db-status")
-def db_status(db: Session = Depends(get_db)):
-    """Return total counts for posts, mentions, and distinct tickers."""
-    total_posts = db.execute(select(func.count(Post.id))).scalar() or 0
-    total_mentions = db.execute(select(func.count(Mention.id))).scalar() or 0
-    total_tickers = db.execute(select(func.count(func.distinct(Mention.ticker)))).scalar() or 0
-
-    return {
-        "total_posts": total_posts,
-        "total_mentions": total_mentions,
-        "total_tickers": total_tickers,
-    }
+@app.delete("/api/alerts/{alert_id}", status_code=204)
+def delete_alert(alert_id: int, db: Session = Depends(get_db)):
+    alert = db.get(Alert, alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    db.delete(alert)
+    db.commit()

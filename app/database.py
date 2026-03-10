@@ -1,5 +1,5 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
 
@@ -27,5 +27,5 @@ def get_db():
 
 
 def init_db():
-    from app.models import schemas  # noqa: F401
+    from app import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
