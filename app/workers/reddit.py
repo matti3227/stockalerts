@@ -1,12 +1,12 @@
 """Reddit scraper — pulls hot posts from finance subreddits via PRAW."""
 import logging
+import os
 import re
 from datetime import datetime
 
 import praw
 from sqlalchemy import select
 
-from app.config import settings
 from app.database import SessionLocal
 from app.models import Mention, Post
 from app.workers.sentiment import analyze
@@ -55,14 +55,15 @@ def extract_tickers(text: str) -> list[str]:
 
 def scrape() -> int:
     """Scrape Reddit finance subreddits. Returns count of new posts saved."""
-    if not settings.reddit_client_id:
+    client_id = os.getenv("REDDIT_CLIENT_ID", "")
+    if not client_id:
         logger.warning("Reddit credentials not configured; skipping Reddit scrape")
         return 0
 
     reddit = praw.Reddit(
-        client_id=settings.reddit_client_id,
-        client_secret=settings.reddit_client_secret,
-        user_agent=settings.reddit_user_agent,
+        client_id=client_id,
+        client_secret=os.getenv("REDDIT_CLIENT_SECRET", ""),
+        user_agent=os.getenv("REDDIT_USER_AGENT", "StockAlerts/2.0"),
     )
 
     total = 0

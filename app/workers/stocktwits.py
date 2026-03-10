@@ -1,12 +1,12 @@
 """StockTwits scraper — fetches trending tickers and their message streams."""
 import logging
+import os
 from datetime import datetime
 from typing import Optional
 
 import httpx
 from sqlalchemy import select
 
-from app.config import settings
 from app.database import SessionLocal
 from app.models import Mention, Post
 from app.workers.sentiment import analyze
@@ -69,8 +69,9 @@ def _get_symbol_stream(client: httpx.Client, headers: dict, ticker: str) -> list
 def scrape() -> int:
     """Scrape StockTwits trending streams. Returns count of new posts saved."""
     headers: dict[str, str] = {}
-    if settings.stocktwits_access_token:
-        headers["Authorization"] = f"OAuth {settings.stocktwits_access_token}"
+    token = os.getenv("STOCKTWITS_ACCESS_TOKEN")
+    if token:
+        headers["Authorization"] = f"OAuth {token}"
 
     total = 0
 

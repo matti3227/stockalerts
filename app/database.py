@@ -1,10 +1,15 @@
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-from app.config import settings
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://postgres:password@localhost:5432/stock_alerts",
+)
 
 engine = create_engine(
-    settings.database_url,
+    DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
     pool_size=10,
