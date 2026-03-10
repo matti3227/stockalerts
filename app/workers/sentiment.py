@@ -1,50 +1,63 @@
-"""FinBERT-based sentiment analysis for financial text.
+"""Keyword-based financial sentiment analysis.
 
-ProsusAI/finbert is a BERT model fine-tuned on financial news and StockTwits
-text. It returns three-class probabilities (positive / negative / neutral).
+Fast, zero-dependency approach using curated bull/bear word lists tuned for
+financial social media (StockTwits, Reddit, news headlines).
 
-The model is lazy-loaded on the first call (~440 MB download on first run).
+Returns the same (score, label, confidence) interface as the previous FinBERT
+implementation so all callers remain unchanged.
 """
-import logging
+import re
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+_BULL_WORDS = {
+    "bullish", "buy", "buying", "bought", "long", "calls", "call",
+    "moon", "mooning", "rocket", "rip", "breakout", "surge", "surging",
+    "rally", "rallying", "gain", "gains", "winning", "win", "pump",
+    "pumping", "up", "upside", "upgrade", "upgraded", "outperform",
+    "beat", "beats", "beat expectations", "strong", "strength",
+    "growth", "growing", "profit", "profits", "revenue", "revenues",
+    "positive", "bull", "bulls", "accumulate", "accumulating",
+    "support", "bounce", "bouncing", "green", "higher", "high",
+    "cheap", "undervalued", "opportunity", "opportunities", "hold",
+    "hodl", "conviction", "confident", "optimistic", "bright",
+    "recover", "recovery", "recovered", "bottom", "bottomed",
+    "oversold", "rebound", "rebounding", "squeeze", "short squeeze",
+    "all time high", "ath", "record", "earnings beat",
+}
 
-_pipeline = None
+_BEAR_WORDS = {
+    "bearish", "sell", "selling", "sold", "short", "puts", "put",
+    "crash", "crashing", "dump", "dumping", "drop", "dropping",
+    "fall", "falling", "fell", "decline", "declining", "loss",
+    "losses", "losing", "lose", "down", "downside", "downgrade",
+    "downgraded", "underperform", "miss", "misses", "missed",
+    "weak", "weakness", "shrink", "shrinking", "negative", "bear",
+    "bears", "distribution", "distributing", "resistance",
+    "red", "lower", "lower", "overvalued", "expensive",
+    "concerned", "worry", "worried", "pessimistic", "trouble",
+    "troubled", "debt", "risk", "risks", "risky", "warning",
+    "bankruptcy", "bankrupt", "collapse", "collapsing",
+    "overbought", "bubble", "correction", "corrections",
+    "layoffs", "layoff", "miss expectations", "earnings miss",
+    "lawsuit", "fraud", "investigation", "sec", "fine", "penalty",
+}
 
-
-def _get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        from transformers import pipeline as _hf_pipeline  # noqa: PLC0415
-
-        logger.info("Loading FinBERT model (first run may download ~440 MB)…")
-        _pipeline = _hf_pipeline(
-            "sentiment-analysis",
-            model="ProsusAI/finbert",
-            tokenizer="ProsusAI/finbert",
-            top_k=None,       # return all three class probabilities
-            truncation=True,
-            max_length=512,
-            device=-1,        # CPU
-        )
-        logger.info("FinBERT ready.")
-    return _pipeline
+_TOKENIZE = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
 
 def analyze(
     text: str,
     author_label: Optional[str] = None,
 ) -> tuple[float, str, float]:
-    """Analyse sentiment of financial text.
+    """Analyse sentiment of financial text using keyword matching.
 
     Returns ``(score, label, confidence)`` where:
-    - ``score``      — signed float: + for bullish, - for bearish, 0 for neutral
+    - ``score``      — float in [-1, +1]; positive = bullish, negative = bearish
     - ``label``      — ``'bullish'``, ``'bearish'``, or ``'neutral'``
-    - ``confidence`` — FinBERT max-class probability (0.0–1.0)
+    - ``confidence`` — signal strength (0.0–1.0)
 
-    If *author_label* is ``'Bullish'`` / ``'Bearish'`` (StockTwits tag),
-    it is trusted directly with ``confidence=1.0``.
+    If *author_label* is supplied (StockTwits author tag), it is trusted
+    directly with ``confidence=1.0``.
     """
     if author_label:
         norm = author_label.lower()
@@ -56,21 +69,22 @@ def analyze(
     if not text or not text.strip():
         return 0.0, "neutral", 0.5
 
-    try:
-        pipe = _get_pipeline()
-        results = pipe(text[:512])[0]   # list of {label, score} dicts
-        by_label = {r["label"].lower(): r["score"] for r in results}
-
-        pos  = by_label.get("positive", 0.0)
-        neg  = by_label.get("negative", 0.0)
-        neu  = by_label.get("neutral",  0.0)
-        conf = max(pos, neg, neu)
-
-        if pos >= neg and pos >= neu:
-            return pos, "bullish", conf
-        if neg >= pos and neg >= neu:
-            return -neg, "bearish", conf
-        return 0.0, "neutral", conf
-    except Exception:
-        logger.exception("FinBERT analysis failed; returning neutral")
+    tokens = _TOKENIZE.findall(text.lower())
+    if not tokens:
         return 0.0, "neutral", 0.5
+
+    bull = sum(1 for t in tokens if t in _BULL_WORDS)
+    bear = sum(1 for t in tokens if t in _BEAR_WORDS)
+    total = bull + bear
+
+    if total == 0:
+        return 0.0, "neutral", 0.5
+
+    score = (bull - bear) / total          # [-1, +1]
+    confidence = min(total / 5.0, 1.0)    # saturates at 5 signal words
+
+    if score > 0.1:
+        return round(score, 4), "bullish", round(confidence, 4)
+    if score < -0.1:
+        return round(score, 4), "bearish", round(confidence, 4)
+    return round(score, 4), "neutral", round(confidence, 4)
